@@ -1,0 +1,25 @@
+build:
+  gong-mcp:
+    context: .
+    dockerfile: Dockerfile
+
+deploy:
+  - name: Sync secret from Okteto user variables
+    command: |
+      EXISTING_JWT_SECRET=$(kubectl get secret gong-mcp-secrets -o jsonpath='{.data.GONG_MCP_JWT_SECRET}' 2>/dev/null | base64 -d || true)
+      if [ -z "$EXISTING_JWT_SECRET" ]; then
+        EXISTING_JWT_SECRET=$(openssl rand -hex 32)
+      fi
+      PUBLIC_URL="https://gong-mcp-${OKTETO_NAMESPACE}.${OKTETO_DOMAIN}"
+      kubectl create secret generic gong-mcp-secrets \
+        --from-literal=GONG_ACCESS_KEY="$GONG_ACCESS_KEY" \
+        --from-literal=GONG_ACCESS_SECRET="$GONG_ACCESS_SECRET" \
+        --from-literal=GONG_MCP_GOOGLE_CLIENT_ID="$GONG_MCP_GOOGLE_CLIENT_ID" \
+        --from-literal=GONG_MCP_GOOGLE_CLIENT_SECRET="$GONG_MCP_GOOGLE_CLIENT_SECRET" \
+        --from-literal=GONG_MCP_PUBLIC_URL="$PUBLIC_URL" \
+        --from-literal=GONG_MCP_JWT_SECRET="$EXISTING_JWT_SECRET" \
+        --dry-run=client -o yaml | kubectl apply -f -
+  - name: Apply Deployment and Service
+    command: |
+      envsubst < k8s/deployment.yaml | kubectl apply -f -
+      kubectl apply -f k8s/service.yaml

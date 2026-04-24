@@ -1,121 +1,90 @@
 # Gong MCP Server
 
-A Model Context Protocol (MCP) server that provides access to Gong's API for retrieving call recordings and transcripts. This server allows Claude to interact with Gong data through a standardized interface.
+A remote MCP server that lets Claude query Okteto's Gong data — call listings and full transcripts — on behalf of any Okteto employee. It runs as an HTTPS service on Okteto, authenticates users via Google SSO against the `okteto.com` Workspace, and calls the Gong API with a single shared access key held on the server.
 
-## Features
+## How it works
 
-- List Gong calls with optional date range filtering
-- Retrieve detailed transcripts for specific calls
-- Secure authentication using Gong's API credentials
-- Standardized MCP interface for easy integration with Claude
+- **Transport**: MCP Streamable HTTP at `POST /mcp`.
+- **User auth**: OAuth 2.1 + PKCE. The MCP server *is* the authorization server; it delegates actual login to Google and restricts `hd=okteto.com`. After login, clients receive a short-lived JWT (1h) signed with a per-deployment secret.
+- **Gong auth**: shared Gong access key/secret held in a Kubernetes `Secret`, never exposed to clients. All users' queries go through the same Gong integration.
+- **Deployment**: Okteto, via `okteto.yaml`. Manifests live under `k8s/`. Auto-HTTPS via the Okteto ingress controller.
 
 ## Prerequisites
 
-- Node.js 18 or higher
-- Docker (optional, for containerized deployment)
-- Gong API credentials (Access Key and Secret)
+- [Okteto CLI](https://www.okteto.com/docs/getting-started/) with access to an Okteto cluster.
+- Permission to create an OAuth client under the `okteto.com` Google Cloud organization.
+- Gong API credentials (access key + secret) with read access to calls and transcripts.
 
-## Installation
+## Deploy
 
-### Local Development
+### 1. Create a Google OAuth client
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Build the project:
-   ```bash
-   npm run build
-   ```
+1. Google Cloud Console → APIs & Services → Credentials → **Create OAuth client ID** → Web application.
+2. OAuth consent screen: **Internal** — this is what actually restricts sign-in to `@okteto.com`.
+3. Authorized redirect URI: `https://gong-mcp-<namespace>.<okteto-domain>/oauth/google/callback`
+   (on `demo.okteto.dev` with namespace `gong-mcp-rberrelleza`: `https://gong-mcp-gong-mcp-rberrelleza.demo.okteto.dev/oauth/google/callback`)
+4. Save the **client ID** and **client secret**.
 
-### Docker
+### 2. Set Okteto user variables
 
-Build the container:
+Okteto UI → User Settings → Variables:
+
+| Variable | Value |
+|---|---|
+| `GONG_ACCESS_KEY` | Gong API access key |
+| `GONG_ACCESS_SECRET` | Gong API access secret |
+| `GONG_MCP_GOOGLE_CLIENT_ID` | From step 1 |
+| `GONG_MCP_GOOGLE_CLIENT_SECRET` | From step 1 |
+
+The deploy step derives `GONG_MCP_PUBLIC_URL` from `$OKTETO_NAMESPACE` + `$OKTETO_DOMAIN`, and generates + preserves `GONG_MCP_JWT_SECRET` across redeploys (so existing JWTs stay valid).
+
+### 3. Deploy
+
 ```bash
-docker build -t gong-mcp .
+okteto deploy --wait
+okteto endpoints
 ```
 
-## Configuring Claude
+## Connect Claude
 
-1. Open Claude Desktop settings
-2. Navigate to the MCP Servers section
-3. Add a new server with the following configuration:
+Point any OAuth-capable MCP client at `<PUBLIC_URL>/mcp`. Claude drives the OAuth dance end-to-end — you'll be redirected to Google, sign in with your `@okteto.com` account, and end up connected.
 
-```json
-{
-  "command": "docker",
-  "args": [
-    "run",
-    "-it",
-    "--rm",
-    "gong-mcp"
-  ],
-  "env": {
-    "GONG_ACCESS_KEY": "your_access_key_here",
-    "GONG_ACCESS_SECRET": "your_access_secret_here"
-  }
-}
+- **claude.ai** → Settings → Connectors → Add custom connector → paste `<PUBLIC_URL>/mcp`.
+- **Claude Desktop / Code** with an OAuth-capable transport: same URL.
+
+## Security model
+
+- Only `@okteto.com` Google Workspace accounts can sign in. Enforced at three layers: Google consent screen (Internal), `hd` + email check at the `/oauth/google/callback`, and email-domain check on every `/mcp` request's JWT.
+- Gong credentials never leave the server. Users cannot see or extract them.
+- Access tokens are signed with a per-deployment secret held in the k8s `Secret`; if the secret is rotated, all outstanding tokens become invalid.
+- PKCE (S256) is required on every authorization flow.
+- CORS is restricted to `https://claude.ai` for `/mcp`; OAuth discovery endpoints are CORS-open (per spec).
+
+## Available tools
+
+### `list_calls`
+
+Lists Gong calls, optionally filtered by date range.
+
+| Argument | Type | Notes |
+|---|---|---|
+| `fromDateTime` | string | ISO 8601, e.g. `2024-03-01T00:00:00Z` |
+| `toDateTime` | string | ISO 8601, e.g. `2024-03-31T23:59:59Z` |
+
+### `retrieve_transcripts`
+
+Returns full transcripts for a list of call IDs, including per-speaker sentences with timestamps.
+
+| Argument | Type | Notes |
+|---|---|---|
+| `callIds` | string[] | Required. Array of Gong call IDs |
+
+## Repo layout
+
 ```
-
-4. Replace the placeholder credentials with your actual Gong API credentials from your `.env` file
-
-## Available Tools
-
-### List Calls
-
-Retrieves a list of Gong calls with optional date range filtering.
-
-```typescript
-{
-  name: "list_calls",
-  description: "List Gong calls with optional date range filtering. Returns call details including ID, title, start/end times, participants, and duration.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      fromDateTime: {
-        type: "string",
-        description: "Start date/time in ISO format (e.g. 2024-03-01T00:00:00Z)"
-      },
-      toDateTime: {
-        type: "string",
-        description: "End date/time in ISO format (e.g. 2024-03-31T23:59:59Z)"
-      }
-    }
-  }
-}
+src/index.ts        — Express server: OAuth endpoints + MCP transport + Gong client
+k8s/deployment.yaml — Deployment (mounts Secret as env via envFrom)
+k8s/service.yaml    — Service with dev.okteto.com/auto-ingress annotation
+okteto.yaml         — build + deploy steps (secret sync, manifest apply)
+Dockerfile          — node:22-alpine, non-root, multi-stage build
 ```
-
-### Retrieve Transcripts
-
-Retrieves detailed transcripts for specified call IDs.
-
-```typescript
-{
-  name: "retrieve_transcripts",
-  description: "Retrieve transcripts for specified call IDs. Returns detailed transcripts including speaker IDs, topics, and timestamped sentences.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      callIds: {
-        type: "array",
-        items: { type: "string" },
-        description: "Array of Gong call IDs to retrieve transcripts for"
-      }
-    },
-    required: ["callIds"]
-  }
-}
-```
-
-## License
-
-MIT License - see LICENSE file for details
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request 

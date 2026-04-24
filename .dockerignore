@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs and deps
+node_modules
+dist
+build
+
+# VCS and editor state
+.git
+.gitignore
+.idea
+.vscode
+
+# Logs, coverage, temp
+*.log
+coverage
+tmp
+temp
+
+# Files not needed for the image
+README.md
+LICENSE
+k8s
+okteto.yaml
+Dockerfile
+.dockerignore

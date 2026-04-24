@@ -1,18 +1,23 @@
-FROM node:18-alpine
+# syntax=docker/dockerfile:1.7
 
+FROM node:22-alpine AS builder
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+COPY package.json ./
+RUN --mount=type=cache,target=/root/.npm npm install --no-audit --no-fund
 
-# Install dependencies
-RUN npm install 2>&1
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
 
-# Copy source code
-COPY . .
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
 
-# Build TypeScript code
-RUN npm run build 2>&1
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/dist ./dist
+COPY --chown=node:node package.json ./
 
-# Start the server
-CMD ["sh", "-c", "node dist/index.js 2>&1"] 
+USER node
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
