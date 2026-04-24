@@ -81,37 +81,40 @@ interface GongRetrieveTranscriptsArgs {
 }
 
 class GongClient {
-  private accessKey: string;
-  private accessSecret: string;
+  private basicAuth: string;
 
   constructor(accessKey: string, accessSecret: string) {
-    this.accessKey = accessKey;
-    this.accessSecret = accessSecret;
-  }
-
-  private generateSignature(method: string, path: string, timestamp: string, params?: unknown): string {
-    const stringToSign = `${method}\n${path}\n${timestamp}\n${params ? JSON.stringify(params) : ''}`;
-    return crypto.createHmac('sha256', this.accessSecret).update(stringToSign).digest('base64');
+    this.basicAuth = `Basic ${Buffer.from(`${accessKey}:${accessSecret}`).toString('base64')}`;
   }
 
   private async request<T>(method: string, path: string, params?: Record<string, string | undefined>, data?: Record<string, unknown>): Promise<T> {
-    const timestamp = new Date().toISOString();
     const url = `${GONG_API_URL}${path}`;
-
-    const response = await axios({
-      method,
-      url,
-      params,
-      data,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Gong-AccessKey': this.accessKey,
-        'X-Gong-Timestamp': timestamp,
-        'X-Gong-Signature': this.generateSignature(method, path, timestamp, data || params)
+    try {
+      const response = await axios({
+        method,
+        url,
+        params,
+        data,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': this.basicAuth,
+        }
+      });
+      log('gong.request.success', { method, path, status: response.status });
+      return response.data as T;
+    } catch (err) {
+      if (axios.isAxiosError(err)) {
+        log('gong.request.error', {
+          method,
+          path,
+          status: err.response?.status ?? null,
+          response_body: err.response?.data ?? null,
+        });
+      } else {
+        log('gong.request.error', { method, path, reason: 'non_axios', details: String(err) });
       }
-    });
-
-    return response.data as T;
+      throw err;
+    }
   }
 
   async listCalls(fromDateTime?: string, toDateTime?: string): Promise<GongListCallsResponse> {
@@ -239,6 +242,16 @@ function createMcpServer(): Server {
           };
       }
     } catch (error) {
+      if (axios.isAxiosError(error)) {
+        log('mcp.upstream_error_masked', {
+          tool: request.params.name,
+          upstream_status: error.response?.status ?? null,
+        });
+        return {
+          content: [{ type: "text", text: "Internal server error" }],
+          isError: true,
+        };
+      }
       return {
         content: [
           {
@@ -318,10 +331,37 @@ function issueAccessToken(userEmail: string, clientId: string): string {
   return jwt.sign(payload, GONG_MCP_JWT_SECRET!, { algorithm: 'HS256' });
 }
 
+function log(event: string, fields: Record<string, unknown> = {}): void {
+  const payload = { ts: new Date().toISOString(), event, ...fields };
+  console.log(JSON.stringify(payload));
+}
+
+function decodeJwtClaimsUnsafe(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const resourceMetadata = `${GONG_MCP_PUBLIC_URL}/.well-known/oauth-protected-resource`;
   const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
+  const clientInfo = {
+    path: req.path,
+    origin: req.headers.origin ?? null,
+    ua: req.headers['user-agent'] ?? null,
+  };
+  if (!header) {
+    log('auth.fail', { reason: 'no_authorization_header', ...clientInfo });
+    res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}"`);
+    res.status(401).json({ error: 'missing bearer token' });
+    return;
+  }
+  if (!header.startsWith('Bearer ')) {
+    log('auth.fail', { reason: 'wrong_scheme', scheme_prefix: header.slice(0, 10), ...clientInfo });
     res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}"`);
     res.status(401).json({ error: 'missing bearer token' });
     return;
@@ -334,12 +374,29 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
       audience: GONG_MCP_PUBLIC_URL!,
     }) as AccessTokenPayload;
     if (!payload.email || !payload.email.endsWith(`@${OKTETO_EMAIL_DOMAIN}`)) {
+      log('auth.fail', { reason: 'wrong_domain', email: payload.email, ...clientInfo });
       res.set('WWW-Authenticate', `Bearer error="insufficient_scope"`);
       res.status(403).json({ error: 'forbidden' });
       return;
     }
+    log('auth.success', { email: payload.email, client_id: payload.client_id, ...clientInfo });
     next();
-  } catch {
+  } catch (err) {
+    const jwtError = err instanceof Error ? err.name : 'unknown';
+    const jwtMessage = err instanceof Error ? err.message : String(err);
+    const claims = decodeJwtClaimsUnsafe(token);
+    log('auth.fail', {
+      reason: 'jwt_verify_failed',
+      jwt_error: jwtError,
+      jwt_message: jwtMessage,
+      token_length: token.length,
+      claims_iss: claims?.iss ?? null,
+      claims_aud: claims?.aud ?? null,
+      claims_exp: claims?.exp ?? null,
+      claims_email: claims?.email ?? null,
+      claims_alg: null,
+      ...clientInfo,
+    });
     res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}", error="invalid_token"`);
     res.status(401).json({ error: 'invalid token' });
   }
@@ -397,6 +454,7 @@ app.post('/register', express.json({ limit: '16kb' }), (req, res) => {
   const body = req.body ?? {};
   const redirect_uris = body.redirect_uris;
   if (!Array.isArray(redirect_uris) || redirect_uris.length === 0 || !redirect_uris.every((u: unknown) => typeof u === 'string')) {
+    log('oauth.register.error', { reason: 'invalid_redirect_uris', body_keys: Object.keys(body) });
     res.status(400).json({ error: 'invalid_client_metadata', error_description: 'redirect_uris is required' });
     return;
   }
@@ -408,6 +466,12 @@ app.post('/register', express.json({ limit: '16kb' }), (req, res) => {
     created_at: Date.now(),
   };
   clients.set(client_id, client);
+  log('oauth.register.success', {
+    client_id,
+    client_name: client.client_name ?? null,
+    redirect_uris,
+    ua: req.headers['user-agent'] ?? null,
+  });
   res.status(201).json({
     client_id,
     redirect_uris,
@@ -429,24 +493,37 @@ app.get('/authorize', (req, res) => {
     code_challenge_method,
   } = req.query as Record<string, string | undefined>;
 
+  log('oauth.authorize.start', {
+    client_id: client_id ?? null,
+    redirect_uri: redirect_uri ?? null,
+    response_type: response_type ?? null,
+    scope: scope ?? null,
+    has_pkce: !!code_challenge,
+    pkce_method: code_challenge_method ?? null,
+  });
   if (response_type !== 'code') {
+    log('oauth.authorize.error', { reason: 'bad_response_type', response_type: response_type ?? null });
     res.status(400).send('response_type must be code');
     return;
   }
   if (!client_id || !redirect_uri) {
+    log('oauth.authorize.error', { reason: 'missing_client_or_redirect' });
     res.status(400).send('client_id and redirect_uri required');
     return;
   }
   const client = clients.get(client_id);
   if (!client) {
+    log('oauth.authorize.error', { reason: 'unknown_client_id', client_id, known_clients: clients.size });
     res.status(400).send('invalid client_id');
     return;
   }
   if (!client.redirect_uris.includes(redirect_uri)) {
+    log('oauth.authorize.error', { reason: 'redirect_uri_not_registered', client_id, redirect_uri, registered: client.redirect_uris });
     res.status(400).send('redirect_uri not registered for this client');
     return;
   }
   if (!code_challenge || code_challenge_method !== 'S256') {
+    log('oauth.authorize.error', { reason: 'missing_or_bad_pkce', has_challenge: !!code_challenge, method: code_challenge_method ?? null });
     res.status(400).send('PKCE with S256 required');
     return;
   }
@@ -478,15 +555,18 @@ app.get('/authorize', (req, res) => {
 app.get('/oauth/google/callback', async (req, res) => {
   const { code, state, error } = req.query as Record<string, string | undefined>;
   if (error) {
+    log('oauth.google.callback.error', { reason: 'google_returned_error', google_error: error });
     res.status(400).send(`google oauth error: ${error}`);
     return;
   }
   if (!code || !state) {
+    log('oauth.google.callback.error', { reason: 'missing_code_or_state', has_code: !!code, has_state: !!state });
     res.status(400).send('missing code or state');
     return;
   }
   const pending = pendingAuths.get(state);
   if (!pending) {
+    log('oauth.google.callback.error', { reason: 'invalid_or_expired_state', pending_count: pendingAuths.size });
     res.status(400).send('invalid or expired state');
     return;
   }
@@ -514,10 +594,12 @@ app.get('/oauth/google/callback', async (req, res) => {
       hd?: string;
     };
     if (!email || !email_verified) {
+      log('oauth.google.callback.error', { reason: 'email_not_verified', email: email ?? null });
       res.status(403).send('email not verified by google');
       return;
     }
     if (hd !== OKTETO_EMAIL_DOMAIN || !email.endsWith(`@${OKTETO_EMAIL_DOMAIN}`)) {
+      log('oauth.google.callback.error', { reason: 'wrong_domain', email, hd: hd ?? null });
       res.status(403).send(`access restricted to @${OKTETO_EMAIL_DOMAIN} accounts`);
       return;
     }
@@ -532,43 +614,62 @@ app.get('/oauth/google/callback', async (req, res) => {
       created_at: Date.now(),
     });
 
+    log('oauth.google.callback.success', { email, client_id: pending.client_id });
+
     const redirectUrl = new URL(pending.redirect_uri);
     redirectUrl.searchParams.set('code', ourCode);
     if (pending.client_state) redirectUrl.searchParams.set('state', pending.client_state);
     res.redirect(redirectUrl.toString());
   } catch (e: unknown) {
     const message = axios.isAxiosError(e) ? JSON.stringify(e.response?.data ?? e.message) : String(e);
-    console.error('google token exchange failed:', message);
+    log('oauth.google.callback.error', { reason: 'token_exchange_exception', details: message });
     res.status(500).send('token exchange failed');
   }
 });
 
 app.post('/token', express.urlencoded({ extended: true }), (req, res) => {
   const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body as Record<string, string | undefined>;
+  log('oauth.token.request', {
+    grant_type: grant_type ?? null,
+    client_id: client_id ?? null,
+    has_code: !!code,
+    has_verifier: !!code_verifier,
+  });
   if (grant_type !== 'authorization_code') {
+    log('oauth.token.error', { reason: 'unsupported_grant_type', grant_type: grant_type ?? null });
     res.status(400).json({ error: 'unsupported_grant_type' });
     return;
   }
   if (!code || !redirect_uri || !client_id || !code_verifier) {
+    log('oauth.token.error', { reason: 'missing_fields', has_code: !!code, has_redirect_uri: !!redirect_uri, has_client_id: !!client_id, has_verifier: !!code_verifier });
     res.status(400).json({ error: 'invalid_request', error_description: 'code, redirect_uri, client_id, code_verifier required' });
     return;
   }
   const authCode = authCodes.get(code);
   if (!authCode) {
+    log('oauth.token.error', { reason: 'unknown_or_reused_code', client_id });
     res.status(400).json({ error: 'invalid_grant' });
     return;
   }
   authCodes.delete(code);
   if (authCode.client_id !== client_id || authCode.redirect_uri !== redirect_uri) {
+    log('oauth.token.error', {
+      reason: 'client_or_redirect_mismatch',
+      request_client_id: client_id,
+      code_client_id: authCode.client_id,
+      redirect_match: authCode.redirect_uri === redirect_uri,
+    });
     res.status(400).json({ error: 'invalid_grant', error_description: 'client/redirect mismatch' });
     return;
   }
   const computed = crypto.createHash('sha256').update(code_verifier).digest('base64url');
   if (computed !== authCode.code_challenge) {
+    log('oauth.token.error', { reason: 'pkce_failed', client_id, email: authCode.user_email });
     res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
     return;
   }
   const token = issueAccessToken(authCode.user_email, authCode.client_id);
+  log('oauth.token.success', { client_id, email: authCode.user_email, expires_in: ACCESS_TOKEN_TTL_SECONDS });
   res.json({
     access_token: token,
     token_type: 'Bearer',
@@ -584,6 +685,11 @@ app.get('/health', (_req, res) => {
 });
 
 app.post('/mcp', requireAuth, async (req, res) => {
+  const body = req.body as { method?: string; params?: { name?: string } } | undefined;
+  log('mcp.request', {
+    method: body?.method ?? null,
+    tool: body?.params?.name ?? null,
+  });
   const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -596,7 +702,10 @@ app.post('/mcp', requireAuth, async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error('MCP request failed:', err);
+    log('mcp.error', {
+      method: body?.method ?? null,
+      error: err instanceof Error ? err.message : String(err),
+    });
     if (!res.headersSent) {
       res.status(500).json({ error: 'internal error' });
     }
@@ -612,5 +721,11 @@ app.delete('/mcp', requireAuth, (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`gong-mcp listening on :${PORT}`);
+  log('server.start', {
+    port: PORT,
+    public_url: GONG_MCP_PUBLIC_URL,
+    allowed_domain: OKTETO_EMAIL_DOMAIN,
+    access_token_ttl_s: ACCESS_TOKEN_TTL_SECONDS,
+    jwt_secret_len: GONG_MCP_JWT_SECRET!.length,
+  });
 });
