@@ -19,7 +19,8 @@ deploy:
         --from-literal=GONG_MCP_PUBLIC_URL="$PUBLIC_URL" \
         --from-literal=GONG_MCP_JWT_SECRET="$EXISTING_JWT_SECRET" \
         --dry-run=client -o yaml | kubectl apply -f -
-  - name: Apply Deployment and Service
+  - name: Apply PVC, Deployment and Service
     command: |
+      kubectl apply -f k8s/pvc.yaml
       envsubst < k8s/deployment.yaml | kubectl apply -f -
       kubectl apply -f k8s/service.yaml

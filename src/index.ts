@@ -11,7 +11,9 @@ import axios from 'axios';
 import cors from 'cors';
 import crypto from 'crypto';
 import express, { NextFunction, Request, Response } from 'express';
+import fs from 'fs';
 import jwt from 'jsonwebtoken';
+import path from 'path';
 
 const GONG_API_URL = 'https://api.gong.io/v2';
 const GONG_ACCESS_KEY = process.env.GONG_ACCESS_KEY;
@@ -23,6 +25,8 @@ const GONG_MCP_PUBLIC_URL = process.env.GONG_MCP_PUBLIC_URL;
 const OKTETO_EMAIL_DOMAIN = 'okteto.com';
 const PORT = Number(process.env.PORT ?? 3000);
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
+const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const STATE_FILE_PATH = process.env.STATE_FILE_PATH ?? '/data/state.json';
 
 const required: Record<string, string | undefined> = {
   GONG_ACCESS_KEY,
@@ -297,9 +301,77 @@ interface AuthCode {
   created_at: number;
 }
 
+interface RefreshTokenRecord {
+  user_email: string;
+  client_id: string;
+  created_at: number;
+  expires_at: number;
+}
+
 const clients = new Map<string, RegisteredClient>();
 const pendingAuths = new Map<string, PendingAuth>();
 const authCodes = new Map<string, AuthCode>();
+const refreshTokens = new Map<string, RefreshTokenRecord>();
+
+interface PersistedState {
+  clients: RegisteredClient[];
+  refresh_tokens: Array<{ token: string } & RefreshTokenRecord>;
+}
+
+function loadState(): void {
+  try {
+    if (!fs.existsSync(STATE_FILE_PATH)) {
+      log('state.load.skip', { reason: 'file_not_found', path: STATE_FILE_PATH });
+      return;
+    }
+    const raw = fs.readFileSync(STATE_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw) as PersistedState;
+    if (Array.isArray(parsed.clients)) {
+      for (const c of parsed.clients) clients.set(c.client_id, c);
+    }
+    if (Array.isArray(parsed.refresh_tokens)) {
+      const now = Date.now();
+      for (const r of parsed.refresh_tokens) {
+        if (r.expires_at > now) {
+          const { token, ...rest } = r;
+          refreshTokens.set(token, rest);
+        }
+      }
+    }
+    log('state.load.success', { clients: clients.size, refresh_tokens: refreshTokens.size });
+  } catch (err) {
+    log('state.load.error', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function saveState(): void {
+  try {
+    const dir = path.dirname(STATE_FILE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const state: PersistedState = {
+      clients: Array.from(clients.values()),
+      refresh_tokens: Array.from(refreshTokens.entries()).map(([token, rec]) => ({ token, ...rec })),
+    };
+    const tmp = `${STATE_FILE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+    fs.renameSync(tmp, STATE_FILE_PATH);
+  } catch (err) {
+    log('state.save.error', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function issueRefreshToken(userEmail: string, clientId: string): string {
+  const now = Date.now();
+  const token = crypto.randomBytes(32).toString('hex');
+  refreshTokens.set(token, {
+    user_email: userEmail,
+    client_id: clientId,
+    created_at: now,
+    expires_at: now + REFRESH_TOKEN_TTL_SECONDS * 1000,
+  });
+  saveState();
+  return token;
+}
 
 const TEN_MINUTES_MS = 10 * 60 * 1000;
 setInterval(() => {
@@ -310,6 +382,14 @@ setInterval(() => {
   for (const [code, ac] of authCodes) {
     if (now - ac.created_at > TEN_MINUTES_MS) authCodes.delete(code);
   }
+  let removedRefresh = 0;
+  for (const [token, rec] of refreshTokens) {
+    if (rec.expires_at <= now) {
+      refreshTokens.delete(token);
+      removedRefresh++;
+    }
+  }
+  if (removedRefresh > 0) saveState();
 }, 60_000).unref();
 
 interface AccessTokenPayload extends jwt.JwtPayload {
@@ -443,7 +523,7 @@ app.get('/.well-known/oauth-authorization-server', publicCors, (_req, res) => {
     token_endpoint: `${GONG_MCP_PUBLIC_URL}/token`,
     registration_endpoint: `${GONG_MCP_PUBLIC_URL}/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
     scopes_supported: ['mcp'],
@@ -466,6 +546,7 @@ app.post('/register', express.json({ limit: '16kb' }), (req, res) => {
     created_at: Date.now(),
   };
   clients.set(client_id, client);
+  saveState();
   log('oauth.register.success', {
     client_id,
     client_name: client.client_name ?? null,
@@ -627,19 +708,14 @@ app.get('/oauth/google/callback', async (req, res) => {
   }
 });
 
-app.post('/token', express.urlencoded({ extended: true }), (req, res) => {
-  const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body as Record<string, string | undefined>;
+function handleAuthorizationCodeGrant(req: Request, res: Response): void {
+  const { code, redirect_uri, client_id, code_verifier } = req.body as Record<string, string | undefined>;
   log('oauth.token.request', {
-    grant_type: grant_type ?? null,
+    grant_type: 'authorization_code',
     client_id: client_id ?? null,
     has_code: !!code,
     has_verifier: !!code_verifier,
   });
-  if (grant_type !== 'authorization_code') {
-    log('oauth.token.error', { reason: 'unsupported_grant_type', grant_type: grant_type ?? null });
-    res.status(400).json({ error: 'unsupported_grant_type' });
-    return;
-  }
   if (!code || !redirect_uri || !client_id || !code_verifier) {
     log('oauth.token.error', { reason: 'missing_fields', has_code: !!code, has_redirect_uri: !!redirect_uri, has_client_id: !!client_id, has_verifier: !!code_verifier });
     res.status(400).json({ error: 'invalid_request', error_description: 'code, redirect_uri, client_id, code_verifier required' });
@@ -668,14 +744,84 @@ app.post('/token', express.urlencoded({ extended: true }), (req, res) => {
     res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
     return;
   }
-  const token = issueAccessToken(authCode.user_email, authCode.client_id);
-  log('oauth.token.success', { client_id, email: authCode.user_email, expires_in: ACCESS_TOKEN_TTL_SECONDS });
+  const accessToken = issueAccessToken(authCode.user_email, authCode.client_id);
+  const refreshToken = issueRefreshToken(authCode.user_email, authCode.client_id);
+  log('oauth.token.success', { grant: 'authorization_code', client_id, email: authCode.user_email, expires_in: ACCESS_TOKEN_TTL_SECONDS });
   res.json({
-    access_token: token,
+    access_token: accessToken,
     token_type: 'Bearer',
     expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    refresh_token: refreshToken,
     scope: 'mcp',
   });
+}
+
+function handleRefreshTokenGrant(req: Request, res: Response): void {
+  const { refresh_token, client_id } = req.body as Record<string, string | undefined>;
+  log('oauth.token.request', {
+    grant_type: 'refresh_token',
+    client_id: client_id ?? null,
+    has_refresh: !!refresh_token,
+  });
+  if (!refresh_token || !client_id) {
+    log('oauth.token.error', { reason: 'missing_fields_refresh', has_refresh: !!refresh_token, has_client_id: !!client_id });
+    res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token and client_id required' });
+    return;
+  }
+  const rec = refreshTokens.get(refresh_token);
+  if (!rec) {
+    log('oauth.token.error', { reason: 'unknown_or_revoked_refresh', client_id });
+    res.status(400).json({ error: 'invalid_grant' });
+    return;
+  }
+  if (rec.client_id !== client_id) {
+    log('oauth.token.error', { reason: 'refresh_client_mismatch', request_client_id: client_id, token_client_id: rec.client_id });
+    refreshTokens.delete(refresh_token);
+    saveState();
+    res.status(400).json({ error: 'invalid_grant' });
+    return;
+  }
+  const now = Date.now();
+  if (rec.expires_at <= now) {
+    log('oauth.token.error', { reason: 'refresh_expired', client_id, email: rec.user_email });
+    refreshTokens.delete(refresh_token);
+    saveState();
+    res.status(400).json({ error: 'invalid_grant' });
+    return;
+  }
+  // Sliding-window rotation: invalidate old, mint new with extended expiry.
+  refreshTokens.delete(refresh_token);
+  const newRefresh = crypto.randomBytes(32).toString('hex');
+  refreshTokens.set(newRefresh, {
+    user_email: rec.user_email,
+    client_id: rec.client_id,
+    created_at: now,
+    expires_at: now + REFRESH_TOKEN_TTL_SECONDS * 1000,
+  });
+  saveState();
+  const accessToken = issueAccessToken(rec.user_email, rec.client_id);
+  log('oauth.token.success', { grant: 'refresh_token', client_id, email: rec.user_email, expires_in: ACCESS_TOKEN_TTL_SECONDS });
+  res.json({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    refresh_token: newRefresh,
+    scope: 'mcp',
+  });
+}
+
+app.post('/token', express.urlencoded({ extended: true }), (req, res) => {
+  const grant_type = (req.body as Record<string, string | undefined>).grant_type;
+  if (grant_type === 'authorization_code') {
+    handleAuthorizationCodeGrant(req, res);
+    return;
+  }
+  if (grant_type === 'refresh_token') {
+    handleRefreshTokenGrant(req, res);
+    return;
+  }
+  log('oauth.token.error', { reason: 'unsupported_grant_type', grant_type: grant_type ?? null });
+  res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
 app.use(express.json({ limit: '1mb' }));
@@ -720,12 +866,16 @@ app.delete('/mcp', requireAuth, (_req, res) => {
   res.status(405).json({ error: 'method not allowed in stateless mode' });
 });
 
+loadState();
+
 app.listen(PORT, () => {
   log('server.start', {
     port: PORT,
     public_url: GONG_MCP_PUBLIC_URL,
     allowed_domain: OKTETO_EMAIL_DOMAIN,
     access_token_ttl_s: ACCESS_TOKEN_TTL_SECONDS,
+    refresh_token_ttl_s: REFRESH_TOKEN_TTL_SECONDS,
+    state_file: STATE_FILE_PATH,
     jwt_secret_len: GONG_MCP_JWT_SECRET!.length,
   });
 });
